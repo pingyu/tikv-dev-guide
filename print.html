@@ -228,14 +228,154 @@
 <p>How 2PC works, how prewrite and commit are processed. (only focus on the optimistic transaction)</p>
 </blockquote>
 <div id="chapter_begin" style="break-before: page; page-break-before: always;"></div><h1 id="scalability"><a class="header" href="#scalability">Scalability</a></h1>
+<p>In the database field, <code>Scalability</code> is the term we use to describe the capability of a system to handle a growing amount of storage or computation. Even if a system is working reliably and fast on a small scale today, it doesn't mean it will necessarily work well in the future, especially when the increased load exceeds what the system can process. In modern systems, the amount of data we have to process can far outgrow our original expectations, so scalability is a critical consideration for the design of a database.</p>
+<p>There are two main types of scalability:</p>
+<ol>
+<li>
+<p>Vertical scaling, which is also known as <strong>scaling up</strong>, means adding resources to a single node in a system, typically involving the improvement of CPU, memory, or storage, to become a more powerful single computer. Vertical scaling is limited by the technology of the semiconductor industry, and the cost per hertz of CPU or byte of memory/storage will increase dramatically when near the technical limit.</p>
+</li>
+<li>
+<p>Horizontal scaling, which is also known as <strong>scaling out</strong>, means adding more machines to a system and distributing the load across multiple smaller machines. As computer prices have dropped and performance continues to increase, high-performance computing applications have adopted low-cost commodity systems for tasks. System architects may deploy hundreds of small computers in a cluster, to obtain aggregate computing power that is far more powerful than a system based on a stand-alone single computer. Moreover, with the widespread use of <a href="https://en.wikipedia.org/wiki/Cloud_computing">Cloud computing</a> technology, horizontal scalable is necessary for a system to adapt to the resiliency of Cloud.</p>
+</li>
+</ol>
+<p>A system whose performance improves after adding hardware, proportionally to the added quantity, is said to be a scalable system. It's obvious that a scalable system depends on the ability of horizontal scaling.</p>
+<p>TiKV is a highly scalable key-value store, especially comparing with other stand-alone key-value stores like <a href="https://rocksdb.org/">RocksDB</a> and <a href="https://github.com/google/leveldb">LevelDB</a>.</p>
+<p>To be scalable, TiKV needs to solve the following problems:</p>
+<ol>
+<li>
+<p>Partitioning: how to break data up into partitions, also known as <em>sharding</em>, to fully utilize resources of nodes in cluster. In TiKV, a partition is called a <code>Region</code>.</p>
+</li>
+<li>
+<p>Scheduling: how to distribute the Regions in cluster, for balancing the load among all nodes, and eliminating hot spots or other bottle necks.</p>
+</li>
+</ol>
+<p>In the rest of this chapter, we will talk about <code>Region</code> and <code>Scheduling</code> of TiKV.</p>
 <div id="chapter_begin" style="break-before: page; page-break-before: always;"></div><h1 id="region"><a class="header" href="#region">Region</a></h1>
-<blockquote>
-<p>what is a region, what is split/merge, and the conditions</p>
-</blockquote>
+<p><strong>Sharding</strong> is one of the most necessary characteristic for a storage system to be scalable (or more specifically, <a href="https://en.wikipedia.org/wiki/Scalability">horizontally scalable</a>). By breaking data up into partitions, a storage system can distribute data across computers in the cluster, to fully utilize resource of every single node. Meanwhile, migrate partitions to re-balance computing and storage loads when adding nodes to cluster, to gain performance improvement proportional to the increasing of number of nodes, i.e, to archive <strong>Scalability</strong>.</p>
+<p><img src="understanding-tikv/scalability/../../media/scalability-data-sharding.png" alt="scalability-data-sharding" />
+<em>Diagram 1, Data Sharding [1]</em></p>
+<p>In TiKV, partition is named as <code>Region</code>, which is the data unit to be distributed and migrated among TiKV nodes. Region is also the data unit to be replicated by <a href="https://raft.github.io/">Raft</a>, to archive <a href="understanding-tikv/scalability/../high-availability/intro.html"><strong>High-Availability</strong></a>. A region is likewise a <code>Raft Group</code> in Raft algorithm, composed of one or more <code>Peer</code>s, while a peer is one of the replica of a partition.</p>
+<p><img src="understanding-tikv/scalability/../../media/scalability-region.png" alt="scalability-region" />
+<em>Diagram 2, Region &amp; Replication [1]</em></p>
+<p>How does TiKV split data into regions? As data element of TiKV is key-value pair, we first decide which keys should be put into a region. In general, there are two approaches:</p>
+<ul>
+<li>
+<p>Sharding by hash: splitting by hash of keys (e.g. <a href="https://en.wikipedia.org/wiki/Consistent_hashing">consistent hashing</a>). It is easier to be implemented, as location of keys can be calculated by clients. But it is more difficult to scale up, consistent hashing makes things more complicated, and not efficient to range queries.</p>
+</li>
+<li>
+<p>Sharding by range: splitting by range of keys. It is simple, good for scan, easy to scale by splitting and merging, even can switch to sharding by hash easily. But it needs additional management of metadata of partition.</p>
+</li>
+</ul>
+<p>TiKV splits data by key range. Each region contains a continuous range of keys. The <a href="https://github.com/tikv/pd"><strong>Placement Driver (PD) server</strong></a> stores the <code>[start_key, end_key)</code> and other <a href="https://github.com/pingcap/kvproto/blob/release-5.2/proto/metapb.proto#L64-L76">metadata</a> of each region, and performs the <a href="understanding-tikv/scalability/scheduling.html">scheduling</a> of regions.</p>
+<p>Then, we determine how many key-value pairs should be stored in one region. The size of a region should not be too small, otherwise the management cost of too many regions would be high. Meanwhile, the size should not be too large, or else region migration would be expensive and time-consuming.</p>
+<p>By default, each region is expected to be about 96MB (see <a href="https://docs.pingcap.com/tidb/stable/tikv-configuration-file#region-split-size">region-split-size</a>) in size. Large regions more than 144MB (see <a href="https://docs.pingcap.com/tidb/stable/tikv-configuration-file#region-max-size">region-max-size</a>) will be split into two or more regions with 96MB each. Small adjacent regions less than 20MB (see <a href="https://docs.pingcap.com/tidb/stable/pd-configuration-file#max-merge-region-size">max-merge-region-size</a>) will be merged to one.</p>
+<p>Moreover, each region is expected to contain more or less 960000 (see <a href="https://docs.pingcap.com/tidb/stable/tikv-configuration-file#region-split-keys">region-split-keys</a>) keys, because region size calculation will need to scan all keys in the region. Big regions with more than 1440000 (see <a href="https://docs.pingcap.com/tidb/stable/tikv-configuration-file#region-max-keys">region-max-keys</a>) keys will be split, while regions with more than 200000 (see <a href="https://docs.pingcap.com/tidb/stable/pd-configuration-file#max-merge-region-keys">max-merge-region-keys</a>) keys will <strong>NOT</strong> be merged.</p>
+<h2 id="reference"><a class="header" href="#reference">Reference</a></h2>
+<p>[1] Wenxuan, PingCAP, <a href="https://docs.google.com/presentation/d/1zF7yRiGt643orPHRFjorUfE8ZTTGwEw9Rdxv6mEc3eQ/edit?usp=sharing">&quot;DEEP DIVE TIKV&quot;</a></p>
 <div id="chapter_begin" style="break-before: page; page-break-before: always;"></div><h1 id="scheduling"><a class="header" href="#scheduling">Scheduling</a></h1>
-<blockquote>
-<p>scoring, operations</p>
-</blockquote>
+<p>This section introduces the scheduling mechanism.</p>
+<p>The scheduling mechanism is mainly by summarizing the collected cluster real-time status information (including the heartbeat of the region and the heartbeat of the store), and then judging whether scheduling needs to be generated according to different strategies, and then generate scheduling <code>Operator</code> which is send to TiKV to do scheduling. the <code>Operator</code>struct like:</p>
+<pre><code class="language-go">    // Operator contains execution steps generated by scheduler.
+    type Operator struct {
+        desc             string
+        brief            string
+        regionID         uint64
+        regionEpoch      *metapb.RegionEpoch
+        kind             OpKind
+        steps            []OpStep
+        stepsTime        []int64 // step finish time
+        currentStep      int32
+        status           OpStatusTracker
+        level            core.PriorityLevel
+    }
+</code></pre>
+<p>Each scheduling <code>Operator</code> is only used to operate a region migration, which including some <code>OpSteps</code>: add peer, transfer the raft group leader and remove peer. an <code>Operator</code> will record the ID of the operator region, the relative strategy name, operator priority level etc. The <code>Operator</code> in PD may be generated from two operate, one is the <code>checker</code> and the other is the <code>scheduler</code>. The generated schedule will be stored in a map, and then it will be returned to the corresponding TiKV through the response when the region heartbeat comes. Let us first look at how checker and scheduler work.</p>
+<h2 id="checker"><a class="header" href="#checker">Checker</a></h2>
+<p>After PD server started, there is a <a href="https://github.com/tikv/pd/blob/release-5.2/server/cluster/coordinator.go#L90-L158">background worker</a> will polling all regions and then check the health status of each region:</p>
+<pre><code class="language-go">    func (c *coordinator) patrolRegions() {
+        timer := time.NewTimer(c.cluster.GetPatrolRegionInterval())
+        for {
+            select {
+            case &lt;-timer.C:
+                timer.Reset(c.cluster.GetPatrolRegionInterval())
+            case &lt;-c.ctx.Done():
+                log.Info(&quot;patrol regions has been stopped&quot;)
+                return
+            }
+
+            regions := c.cluster.ScanRegions(key, nil, patrolScanRegionLimit)
+            for _, region := range regions {
+                if c.checkRegion(region) {
+                    break
+                }
+            }
+        }
+    }
+</code></pre>
+<p>In this function, <code>checkRegion</code> will be executed to determine whether the region needs to be scheduled. If a schedule <code>Operator</code> is generated, it will be sent to TiKV through the heartbeat of this region. The initialization of the checker can be found in <code>coordinator.go</code>, which mainly contains <a href="https://github.com/tikv/pd/blob/release-5.2/server/schedule/checker_controller.go#L64-L107">four checkers</a>: <code>RuleChecker</code>, <code>MergeChecker</code>, <code>JointStateChecker</code> and <code>SplitChecker</code>.</p>
+<p><code>RuleChecker</code> is the most critical checker. It will check whether a region has down peers or offline peers. It will also check whether the number of replicas of the current region is the same as the number of replicas specified in the <a href="https://docs.pingcap.com/tidb/stable/configure-placement-rules#placement-rules"><code>Placement Rules</code></a>. If the conditions are met, it will trigger the logic of the corresponding supplementary replicas or delete the redundant replicas. In addition, <code>RuleChecker</code> will also check whether the current copy of this region is placed in the most reasonable place, and if not, it will be placed in a more reasonable place.</p>
+<p><code>MergeChecker</code> will check whether the current region meets the merge conditions, such as whether the size of the region is less than <code>max-merge-region-size</code>, whether the key of the region is less than <code>max-merge-region-keys</code>, and whether there has been no split operation in the recent period, etc. If these conditions are met, an adjacent region will be selected to try to merge the two regions.</p>
+<h2 id="scheduler"><a class="header" href="#scheduler">Scheduler</a></h2>
+<p>Let's first take a look at the code about the scheduler running process. Schedulers are running concurrently. Each scheduler has a <a href="https://github.com/tikv/pd/blob/release-5.2/server/cluster/coordinator.go#L762-L789">scheduler controller</a>, which running in a background worker:</p>
+<pre><code class="language-go">func (c *coordinator) runScheduler(s *scheduleController) {
+    defer logutil.LogPanic()
+    defer c.wg.Done()
+    defer s.Cleanup(c.cluster)
+
+    timer := time.NewTimer(s.GetInterval())
+    defer timer.Stop()
+
+    for {
+        select {
+        case &lt;-timer.C:
+            timer.Reset(s.GetInterval())
+            if !s.AllowSchedule() {
+                continue
+            }
+            if op := s.Schedule(); len(op) &gt; 0 {
+                added := c.opController.AddWaitingOperator(op...)
+                log.Debug(&quot;add operator&quot;, zap.Int(&quot;added&quot;, added), zap.Int(&quot;total&quot;, len(op)), zap.String(&quot;scheduler&quot;, s.GetName()))
+            }
+
+        case &lt;-s.Ctx().Done():
+            log.Info(&quot;scheduler has been stopped&quot;,
+                zap.String(&quot;scheduler-name&quot;, s.GetName()),
+                errs.ZapError(s.Ctx().Err()))
+            return
+        }
+    }
+}
+</code></pre>
+<p>Similar to the checker, when the PD starts, the specified scheduler will be added according to the configuration. Each scheduler runs in a goroutine by executing <code>go runScheduler</code>, and then executes the <code>Schedule()</code> function at a dynamically adjusted time interval.</p>
+<p>There are two things that a function has to do. The first is to execute the scheduling logic of the corresponding scheduler to determine whether to generate an <code>Operator</code>, and the other is to determine the time interval for the next execution of <code>Schedule()</code>.</p>
+<p>PD contains many schedulers. For details, you can check the <code>server/schedulers</code> package, which contains the implementation of all schedulers. The schedulers that PD will run by default include <code>balance-region-scheduler</code>, <code>balance-leader-scheduler</code>, and <code>balance-hot-region-scheduler</code>. Let's take a look at the specific functions of these schedulers:</p>
+<ul>
+<li>The <a href="https://github.com/tikv/pd/blob/release-5.2/server/schedulers/balance_region.go#L136-L144"><code>balance-region-scheduler</code></a> calculates a score based on the size of the region size on a store and the usage of available space. Then, according to the calculated score, the region is evenly distributed to each store through the <code>Operator</code> that generates the balance-region. The reason why the available space is considered here is that the actual situation may have differences in storage capacity of different stores.</li>
+<li>The <a href="https://github.com/tikv/pd/blob/release-5.2/server/schedulers/balance_leader.go#L137-L153"><code>balance-leader-scheduler</code></a> is similar to the balance-region-scheduler. It calculates a score based on the region count, and then uses the <code>Operator</code> that generates the balance-leader to distribute the leaders as evenly as possible across the stores.</li>
+<li>The <a href="https://github.com/tikv/pd/blob/release-5.2/server/schedulers/hot_region.go#L152-L155"><code>balance-hot-region-scheduler</code></a> implements the related logic of hot spot scheduling. For TiDB, if there are hot spots and only a few stores have hot spots, then the overall resource utilization of the system will be lowered, and it is easy to form a system bottleneck. Therefore, PD also needs to count the hot spots in response to this situation. Come out, and by generating the corresponding schedule, the hot spots are scattered to all stores as much as possible. So that all stores can share the pressure of reading and writing.</li>
+</ul>
+<p>There are some other schedulers to choose from. Each scheduler of PD implements an interface called <a href="https://github.com/tikv/pd/blob/release-5.2/server/schedule/scheduler.go#L33-L45">Scheduler</a>:</p>
+<pre><code class="language-go">// Scheduler is an interface to schedule resources.
+type Scheduler interface {
+    http.Handler
+    GetName() string
+    // GetType should in accordance with the name passing to schedule.RegisterScheduler()
+    GetType() string
+    EncodeConfig() ([]byte, error)
+    GetMinInterval() time.Duration
+    GetNextInterval(interval time.Duration) time.Duration
+    Prepare(cluster opt.Cluster) error
+    Cleanup(cluster opt.Cluster)
+    Schedule(cluster opt.Cluster) []*operator.Operator
+    IsScheduleAllowed(cluster opt.Cluster) bool
+}
+</code></pre>
+<p>The most important thing is the <code>Schedule()</code> interface function, which is used to implement the specific scheduling-related logic of each scheduler.</p>
+<p>In addition, the interface function <code>IsScheduleAllowed()</code> is used to determine whether the scheduler is allowed to execute the corresponding scheduling logic. Before executing the scheduling logic, each scheduler will firstly call this function to determine whether the scheduling rate is exceeded. Specifically, in the code, this function is called <code>AllowSchedule()</code>, and then the <code>IsScheduleAllowed()</code> method implemented by different schedulers is called.</p>
+<p>PD can control the speed at which the scheduler generates operators by setting the limit, but the limit here is just one that maintains a window size, and different operator types have their own window sizes. For example, <code>balance-region</code> schedulers and <code>balance-hot-region</code> schedulers will generate operators related to migrate region, and the type of this operator is <code>OpRegion</code>. We can control the operator of this type of <code>OpRegion</code> by adjusting the <code>region-schedule-limit</code> parameter. The specific operator type definition can be found in the file <a href="https://github.com/tikv/pd/blob/release-5.2/server/schedule/operator/operator.go"><code>operator.go</code></a>. An operator may contain multiple types. For example, the operator generated by <code>balance-hot-region</code> may belong to both <code>OpRegion</code> and <code>OpHotRegion</code>.</p>
+<h2 id="more"><a class="header" href="#more">More</a></h2>
+<p>This section mainly introduces the main operation process of PD scheduling. For more details, you can continue to refer to the corresponding code study. And, welcome to contribute <a href="https://github.com/tikv/pd/contribute">good first issues</a>.</p>
+<p>See more information about PD implementation on <a href="https://github.com/tikv/pd/wiki">its Wiki page</a>.</p>
 <div id="chapter_begin" style="break-before: page; page-break-before: always;"></div><h1 id="high-availability"><a class="header" href="#high-availability">High Availability</a></h1>
 <div id="chapter_begin" style="break-before: page; page-break-before: always;"></div><h1 id="raft"><a class="header" href="#raft">Raft</a></h1>
 <blockquote>
@@ -281,7 +421,58 @@
 <div id="chapter_begin" style="break-before: page; page-break-before: always;"></div><h1 id="encode-1"><a class="header" href="#encode-1">Encode</a></h1>
 <div id="chapter_begin" style="break-before: page; page-break-before: always;"></div><h1 id="import-and-export"><a class="header" href="#import-and-export">Import and Export</a></h1>
 <div id="chapter_begin" style="break-before: page; page-break-before: always;"></div><h1 id="io-rate-limiter"><a class="header" href="#io-rate-limiter">IO Rate Limiter</a></h1>
-<div id="chapter_begin" style="break-before: page; page-break-before: always;"></div><h1 id="coprocessor"><a class="header" href="#coprocessor">Coprocessor</a></h1>
+<div id="chapter_begin" style="break-before: page; page-break-before: always;"></div><h1 id="tikv-coprocessor"><a class="header" href="#tikv-coprocessor">TiKV Coprocessor</a></h1>
+<h2 id="why-coprocessor"><a class="header" href="#why-coprocessor">Why Coprocessor?</a></h2>
+<p>TiKV is a distributed key-value storage engine made for TiDB. When TiDB executes a query, basically, it will need to retrieve and scan full rows from TiKV. Consider the following query: </p>
+<p><img src="understanding-tikv/coprocessor/../../media/tikv-distributed-execution.png" alt="TiKV Distributed Execution" /></p>
+<p>Without TiKV coprocessor, TiDB needs to retrieve all rows from TiKV, and then scan and filter them on the TiDB side, even if we only have a single number as the query result. In order to reduce the network traffic for a query, TiDB pushes some computations down to TiKV Coprocessor, which runs queries on the TiKV side.</p>
+<p>A TiKV cluster is composed of multiple TiKV nodes, and thus TiKV coprocessor cannot run all queries which TiDB supports. On one side, TiKV itself only holds part of the data which a query needs. Therefore, for an aggregation query, each TiKV node can only calculate partial sums, and TiDB needs to aggregate the partial sums into the final sum. On the other side, TiKV Coprocessor only supports a limited number of executors. Complex operations like join cannot be done on TiKV.</p>
+<p>In this article, we will introduce the basics of TiKV Coprocessor from a developer's perspective.</p>
+<h2 id="overview-of-tikv-coprocessor"><a class="header" href="#overview-of-tikv-coprocessor">Overview of TiKV Coprocessor</a></h2>
+<p>The TiKV Coprocessor is able to handle multiple kinds of requests. Previously, we mentioned &quot;push-down execution&quot;. This is handled by DAG handler in the TiKV Coprocessor. The Coprocessor also supports Checksum and Analyze requests. At the same time, the TiKV Coprocessor is not limited to TiDB queries. In Coprocessor v2, developers can dynamically load Coprocessor plugins into a TiKV node, which could process any execution requests that need access to key-value data stored on the TiKV side.</p>
+<p>The code for the TiKV Coprocessor is stored in <a href="https://github.com/tikv/tikv/tree/master/src/coprocessor">src/coprocessor</a> directory. And folders begin with <code>tidb_query_</code> in <a href="https://github.com/tikv/tikv/tree/master/components">components</a> is used by TiKV Coprocessor to run TiDB queries.</p>
+<p>Here we focus on DAG handler in the TiKV Coprocessor. Running queries on the TiKV side requires two things: a plan to run query, and the data needed by a query.</p>
+<p><img src="understanding-tikv/coprocessor/../../media/copr-overview.png" alt="TiKV Coprocessor Executors" /></p>
+<p>For a single query, TiDB will send the plan down to TiKV (the control flow), and TiKV will scan rows of table from the local storage engine (the data flow). TiKV Coprocessor executes the plan with data from the local storage engine, and sends the result back to TiDB.</p>
+<p>The plan and the data exist in different forms throughout the query execution process. In the following parts, we will focus on how they exist on TiKV in each stage.</p>
+<h2 id="the-plan"><a class="header" href="#the-plan">The Plan</a></h2>
+<p>When TiDB needs to run a query on TiKV Coprocessor, it will encode the plan in the form of protobuf messages. The schema of the query plan itself is defined in <a href="https://github.com/pingcap/tipb">tipb</a> repository. Inside tipb, we have all SQL expressions supported by TiKV (and TiDB), each with a unique ID, and we define components used by a query, like executors and aggregators.</p>
+<p>The plan is then sent to the gRPC service on the TiKV side, which requires another protobuf schema definition. The definition for that is in the <a href="https://github.com/pingcap/kvproto/blob/master/proto/coprocessor.proto">kvproto</a> repository. The plan is encoded in the <code>data</code> field of the request. Each Coprocessor request will specify the key range (or region) to operate on.</p>
+<pre><code class="language-protobuf">message Request {
+    kvrpcpb.Context context = 1;
+    int64 tp = 2;
+    bytes data = 3;
+    uint64 start_ts = 7;
+    repeated KeyRange ranges = 4;
+    // ...
+}
+</code></pre>
+<p>As a developer, you may want to see what plan is pushed down to TiKV when running a query. This could be easily done with an SQL <code>explain</code> statement.</p>
+<pre><code class="language-plain">MySQL [test]&gt; explain select count(*) from test where x &gt; 10;
++-----------------------------+---------+-----------+---------------+-------------------------------------------------+
+| id                          | estRows | task      | access object | operator info                                   |
++-----------------------------+---------+-----------+---------------+-------------------------------------------------+
+| StreamAgg_17                | 1.00    | root      |               | funcs:count(Column#4)-&gt;Column#2                 |
+| └─TableReader_18            | 1.00    | root      |               | data:StreamAgg_9                                |
+|   └─StreamAgg_9             | 1.00    | cop[tikv] |               | funcs:count(1)-&gt;Column#4                        |
+|     └─TableRangeScan_16     | 3333.33 | cop[tikv] | table:test    | range:(10,+inf], keep order:false, stats:pseudo |
++-----------------------------+---------+-----------+---------------+-------------------------------------------------+
+4 rows in set (0.002 sec)
+</code></pre>
+<p>A push-down plan is marked as <code>cop[tikv]</code> in the <code>task</code> column.</p>
+<h2 id="the-data"><a class="header" href="#the-data">The Data</a></h2>
+<h3 id="on-disk-format"><a class="header" href="#on-disk-format">On-Disk Format</a></h3>
+<p>TiKV stores its data by rows in its local KV storage engine (as of now, RocksDB or TitanDB). Upon the local KV storage engine, there is a MVCC transactional layer, called TxnKV, which Coprocessor reads data from. The key in TxnKV is composed of the table information and the primary key of a row. And other columns of this row is stored as the value in storage engine. For example,</p>
+<pre><code class="language-plain">t10_r1 --&gt; [&quot;TiDB&quot;, &quot;SQL Layer&quot;, 10]
+t10_r2 --&gt; [&quot;TiKV&quot;, &quot;KV Engine&quot;, 20]
+t10_r3 --&gt; [&quot;PD&quot;, &quot;Manager&quot;, 30]
+</code></pre>
+<p>The TiDB row format (v2) is described in the <a href="https://github.com/pingcap/tidb/blob/master/docs/design/2018-07-19-row-format.md">A new storage row format for efficient decoding</a> RFC.</p>
+<h3 id="in-memory-format"><a class="header" href="#in-memory-format">In-memory Format</a></h3>
+<p>The executors (will be introduced later) will scan the data from  TxnKV in small batches, and store them in memory. Contrary to the on-disk format, data are stored in a columnar way in memory. The memory format is called &quot;Chunk format&quot; in TiDB, and is in some way very similar to the Apache Arrow format. The implementation details are described in the <a href="https://github.com/tikv/rfcs/blob/master/text/0043-copr-chunk.md">Using chunk format in coprocessor framework</a> RFC, and <a href="https://docs.google.com/presentation/d/1fUQTJ6gEscHUag9OhIIePL9uiIYJ61TSpfor-pajBoE/edit#slide=id.g446c4deb4d_0_341">this slide</a>. The format is implemented in <a href="https://github.com/tikv/tikv/tree/master/components/tidb_query_datatype/src/codec/data_type">components/tidb_query_datatype</a> beginning with <code>chunked_vec_</code>.</p>
+<h2 id="inside-coprocessor"><a class="header" href="#inside-coprocessor">Inside Coprocessor</a></h2>
+<p><img src="understanding-tikv/coprocessor/../../media/inside-copr.png" alt="TiKV Coprocessor Internals" /></p>
+<p>The TiKV Coprocessor contains necessary components to handle a cop read request, which include the expression framework, the aggregators, and the executors. We will cover these parts in the following chapters.</p>
 <div id="chapter_begin" style="break-before: page; page-break-before: always;"></div><h1 id="tidb-expression-executor"><a class="header" href="#tidb-expression-executor">TiDB Expression Executor</a></h1>
 <div id="chapter_begin" style="break-before: page; page-break-before: always;"></div><h1 id="coprocessor-plugin"><a class="header" href="#coprocessor-plugin">Coprocessor Plugin</a></h1>
 
